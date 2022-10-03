@@ -1,0 +1,17 @@
+{
+    "compilerOptions": {
+        "module": "commonjs",
+        "moduleResolution": "node",
+        "downlevelIteration": true,
+        "esModuleInterop": true,
+        "noImplicitAny": true,
+        "removeComments": true,
+        "preserveConstEnums": true,
+        "strict": true,
+        "sourceMap": true,
+        "lib": ["ESNext"]
+    },
+    "include": [
+        "src/**/*"
+    ]
+}

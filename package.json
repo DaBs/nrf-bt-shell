@@ -1,0 +1,17 @@
+{
+  "name": "nrf-bt-shell",
+  "version": "0.0.1",
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {
+    "easy-bits": "^1.2.2",
+    "serialport": "^10.4.0",
+    "typescript": "^4.8.4"
+  },
+  "devDependencies": {
+    "@types/lodash.merge": "^4.6.7",
+    "@types/node": "^18.7.23",
+    "nodemon": "^2.0.20",
+    "ts-node": "^10.9.1"
+  }
+}
