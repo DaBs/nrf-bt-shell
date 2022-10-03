@@ -1,8 +1,10 @@
 import { SerialPort } from "serialport";
 import { BitSet, BitField } from 'easy-bits';
+import stripAnsi from 'strip-ansi';
 import { escapeRegExp } from "./utils";
-import { CHARACTERISTIC_OUTPUT_PATTERN, SERVICE_OUTPUT_PATTERN } from "./patterns";
-import { timeStamp } from "console";
+import { CHARACTERISTIC_DEFINITION_OUTPUT_PATTERN, CHARACTERISTIC_PROPERTIES_PATTERN, SERVICE_OUTPUT_PATTERN } from "./patterns";
+
+const NRF_READ_OUTPUT_LENGTH = 16;
 
 export enum AdvertisedProperties {
     CONNECTABLE = 0,
@@ -45,6 +47,7 @@ export interface NRFDescriptors {
 export interface NRFBTCharacteristic {
     uuid: string;
     handle: string;
+    serviceUUID?: string;
     properties: BitSet<CharacteristicProperties>;
     value?: Buffer;
 }
@@ -141,6 +144,21 @@ export class NRFBTShell {
         this.serialPort?.write(message + '\n');
     }
 
+    private cleanMessages(messages: string): string;
+    private cleanMessages(messages: string[]): string[];
+    private cleanMessages(messages: any): any {
+        if (typeof messages === 'string') {
+            const result = messages.replace(/(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]/gm, '').replace(/uart:~\$ /gm, '');
+            return result;
+        } else {
+            const results = messages.map((message: string) => {
+                const result = message.replace(/(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]/gm, '').replace(/uart:~\$ /gm, '');
+                return result;
+            });
+            return results;
+        }
+    }
+
 
     private collectMessagesBetween(startPattern: RegExp, endPattern: RegExp): Promise<string> {
 
@@ -159,14 +177,10 @@ export class NRFBTShell {
                 } else {
                     collectorMessageBuffer += dataString;
                     const endPatternMatches = collectorMessageBuffer.match(endPattern);
-                    console.log(collectorMessageBuffer);
                     if (endPatternMatches) {
-                        let cleanDataString = collectorMessageBuffer.replace(/\r\n/gm, '')
-                        cleanDataString = cleanDataString.replace(/\\x1B\[[0-9J;]*/gm, '');
-                        cleanDataString = cleanDataString.replace(/muart:~\$[ m]?[ mD]?[ mD]?/gm, '');
-                        console.log(endPatternMatches);
-                        console.log(cleanDataString);
+                        // console.log(collectorMessageBuffer);
                         this.serialPort?.off("data", onData);
+                        collectorMessageBuffer = this.cleanMessages(collectorMessageBuffer);
                         resolve(collectorMessageBuffer);
                     }
                 }
@@ -184,6 +198,7 @@ export class NRFBTShell {
             const dataString = data.toString("ascii");
             messageBuffer += dataString;
             if (messageBuffer.includes('\n')) {
+                messageBuffer = this.cleanMessages(messageBuffer);
                 const matches = filterByPattern ? messageBuffer.match(filterByPattern) : null;
                 const stopMatch = stopPattern ? !!messageBuffer.match(stopPattern) : false;
                 if (!filterByPattern || matches) {
@@ -255,6 +270,25 @@ export class NRFBTShell {
         this.btServices[address][service.uuid] = service;
     }
 
+    private addCharacteristicForDevice(characteristic: NRFBTCharacteristic, address: string) {
+        if (!this.btCharacteristics[address]) {
+            this.btCharacteristics[address] = {};
+        }
+
+        this.btCharacteristics[address][characteristic.uuid] = { ...this.btCharacteristics[address][characteristic.uuid], ...characteristic };
+    }
+
+    private parsePropertyRawToProperty(propertyRaw: string) {
+        switch (propertyRaw) {
+            case "[write]": return CharacteristicProperties.WRITE;
+            case "[write w/w rsp]": return CharacteristicProperties.WRITE_WITHOUT_RESPONSE;
+            case "[read]": return CharacteristicProperties.READ;
+            case "[notify]": return CharacteristicProperties.NOTIFY;
+            case "[indicate]": return CharacteristicProperties.INDICATE;
+            default: return null;
+        }
+    }
+
     public async init() {
         if (!this.serialPort) {
             await new Promise((resolve, reject) => {
@@ -269,6 +303,16 @@ export class NRFBTShell {
         }
 
         if (!this.serialPort) throw new Error('Somehow failed setting serial port');
+
+        let dataBuff = '';
+        this.serialPort.on('data', (data) => {
+            const dataString = data.toString("ascii");
+            dataBuff += dataString;
+            if (dataBuff.includes('\n')) {
+                //console.log(dataBuff);
+                dataBuff = '';
+            }
+        });
 
         const initPromise = this.waitForMessage('Bluetooth initialized');
         this.writeMessage('bt init');
@@ -337,17 +381,114 @@ export class NRFBTShell {
         const collectedBufferPromise = this.collectMessagesBetween(/Discover pending/, /Discover complete/);
         this.writeMessage(`gatt discover-characteristic : ${service.startHandle} ${service.endHandle}`);
         let collectedBuffer = await collectedBufferPromise;
-        const characteristicMatches = collectedBuffer.matchAll(CHARACTERISTIC_OUTPUT_PATTERN);
-        const characteristicsArr = [...characteristicMatches];
-        console.log(characteristicsArr);
+        const outputLines = collectedBuffer.split('\n');
+
+        let currentCharacteristic: NRFBTCharacteristic | null = null;
+        let characteristics: NRFBTCharacteristic[] = [];
+
+        for (let i = 0; i < outputLines.length; i++) {
+            const currentLine = outputLines[i];
+            if (!currentCharacteristic) {
+                const characteristicMatches = currentLine.match(CHARACTERISTIC_DEFINITION_OUTPUT_PATTERN);
+                if (characteristicMatches) {
+                    const [, uuid, handle] = characteristicMatches;
+                    const characteristicProperties = new BitField<CharacteristicProperties>();
+                    currentCharacteristic = { uuid, handle, serviceUUID, properties: characteristicProperties };
+                    if (outputLines[i + 1]?.includes('Properties:')) {
+                        i++; // We skip this line;
+                        let propertiesLine = i + 1;
+                        let propertiesMatch = null;
+                        do {
+                            propertiesMatch = outputLines[propertiesLine].match(CHARACTERISTIC_PROPERTIES_PATTERN);
+                            if (propertiesMatch) {
+                                const [, propertyRaw] = propertiesMatch;
+                                const property = this.parsePropertyRawToProperty(propertyRaw);
+                                if (property) {
+                                    currentCharacteristic.properties.on(property);
+                                }
+                                propertiesLine++;
+                            }
+                        } while (propertiesMatch);
+                        i = propertiesLine;
+                    }
+                    characteristics.push({ ...currentCharacteristic });
+                    this.addCharacteristicForDevice({ ...currentCharacteristic }, btAddress);
+                    currentCharacteristic = null;
+                }
+            }
+        }
+
+        return characteristics;
     }
 
     public async discoverAllServicesAndCharacteristics(btAddress: string) {
+        await this.guardSelectedDevice(btAddress);
         const services = await this.discoverPrimaryServices(btAddress);
-        console.log(services);
         for (const service of Object.values(services)) {
-            const characteristics = await this.discoverCharacteristicsForService(btAddress, service.uuid)
+            await this.discoverCharacteristicsForService(btAddress, service.uuid);
         }
+    }
+
+    public async readCharacteristic(btAddress: string, characteristicUUID: string) {
+        await this.guardSelectedDevice(btAddress);
+        const characteristic = this.btCharacteristics[btAddress][characteristicUUID];
+        const collectedMessagesPromise = this.collectMessagesBetween(/Read pending/, /Read complete: err (0x\d{2}) length 0/);
+        this.writeMessage(`gatt read ${parseInt(characteristic.handle, 10) + 1} 0`);
+        const collectedMessages = await collectedMessagesPromise;
+        let collectedLines = collectedMessages.split('\n');
+
+        let collectedBuffer = Buffer.alloc(0).fill(0x00);
+
+        for (let i = 0; i < collectedLines.length; i++) {
+            
+            let currentReadMatch = null;
+            let currentReadLength = 0;
+            do {
+                currentReadMatch = collectedLines[i].match(/Read complete: err (0x\d{2}) length (\d+)/);
+                if (!currentReadMatch) continue;
+
+                const error = currentReadMatch[1];
+                if (error !== '0x00') throw new Error(`Error reading, err: ${error}`);
+
+                currentReadLength = parseInt(currentReadMatch[2] || '0', 10);
+                if (currentReadMatch && currentReadLength !== 0) {
+                    i++;
+                    const linesToEat = Math.ceil(currentReadLength / NRF_READ_OUTPUT_LENGTH);
+                    let linesBuffer = Buffer.alloc(currentReadLength);
+                    for (let j = 0; j < linesToEat; j++) {
+                        const valueLine = collectedLines[i + j];
+                        const matches = valueLine.match(/(\d{8}): ([a-zA-Z0-9 ]+)/);
+                        if (!matches) continue;
+                        const [, offsetRaw, rawHexString] = matches;
+                        const offset = parseInt(offsetRaw, 16);
+                        const buffer = Buffer.from(rawHexString.replace(/ /gm, ''), 'hex');
+                        buffer.copy(linesBuffer, offset);
+                    }
+                    collectedBuffer = Buffer.concat([collectedBuffer, linesBuffer]);
+                    i += linesToEat;
+                }
+            } while(currentReadMatch && currentReadLength !== 0);
+        }
+
+        return collectedBuffer;
+    }
+
+    public async writeCharacteristic(btAddress: string, characteristicUUID: string, data: Buffer): Promise<boolean> {
+        await this.guardSelectedDevice(btAddress);
+        const characteristic = this.btCharacteristics[btAddress][characteristicUUID];
+        const waitingPromise = this.waitForMessage(/Write complete: err (0x\d{2})/);
+        this.writeMessage(`gatt write ${parseInt(characteristic.handle, 10) + 1} 0 ${data.toString('hex')}`);
+        const { message, matches } = await waitingPromise;
+        if (matches && matches[1] !== '0x00') {
+            throw new Error(`Error writing to characteristic ${characteristic.uuid}, err: ${matches[1]}`);
+        }
+
+        return true;
+    }
+
+    public async monitorCharacteristic(btAddress: string, characteristicUUID: string) {
+        await this.guardSelectedDevice(btAddress);
+        const characteristic = this.btCharacteristics[btAddress][characteristicUUID];
     }
 
 

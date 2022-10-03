@@ -14,6 +14,10 @@ const main = async () => {
     await shell.connect(device.address);
     console.log('Connected');
     await shell.discoverAllServicesAndCharacteristics(device.address);
+    console.log('Discovered all services and characteristics');
+    const value = await shell.readCharacteristic(device.address, '57ba394e-4abd-4a91-b802-10d3a0d100f5');
+    console.log(value);
+    await shell.writeCharacteristic(device.address, 'd9b912db-ba72-4aff-b517-2c8a95401cfd', Buffer.from([0xaa, 0xbb]));
 }
 
 
