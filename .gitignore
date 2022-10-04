@@ -4,3 +4,6 @@ node_modules
 # Yarn
 yarn-error.log
 *.log
+
+# Build output
+dist

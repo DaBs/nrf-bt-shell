@@ -46,7 +46,7 @@ export interface NRFDescriptors {
 
 export interface NRFBTCharacteristic {
     uuid: string;
-    handle: string;
+    handle: number;
     serviceUUID?: string;
     properties: BitSet<CharacteristicProperties>;
     value?: Buffer;
@@ -64,13 +64,14 @@ export interface NRFBTDevice {
     addressType: NRFBTAddressType;
     advertisedProperties: BitSet<AdvertisedProperties>;
     rssi: number;
+    mtu?: number;
     name?: string;
     scanResponse?: Buffer;
 }
 
 export class NRFBTShell {
 
-    private comPort: string;
+    private path: string;
     private baudRate: number;
 
     private currentIncomingMessage: string = '';
@@ -86,13 +87,13 @@ export class NRFBTShell {
     private scanUnsubscribe: (() => void) | null = null;
 
     constructor(path: string = 'COM3', baudRate: number = 115200) {
-        this.comPort = path;
+        this.path = path;
         this.baudRate = baudRate;
     }
 
-    private updateDevice(address: string, device: NRFBTDevice): NRFBTDevice {
+    private updateDevice(address: string, device: Partial<NRFBTDevice>): NRFBTDevice {
         if (!this.btDevices[address]) {
-            this.btDevices[address] = device;
+            this.btDevices[address] = { ...device, address } as NRFBTDevice;
         }
 
         this.btDevices[address] = { ...this.btDevices[address], ...device };
@@ -202,6 +203,7 @@ export class NRFBTShell {
                 const matches = filterByPattern ? messageBuffer.match(filterByPattern) : null;
                 const stopMatch = stopPattern ? !!messageBuffer.match(stopPattern) : false;
                 if (!filterByPattern || matches) {
+                    if (filterByPattern && filterByPattern.lastIndex) filterByPattern.lastIndex = 0;
                     callback(messageBuffer, matches);
                 }
 
@@ -292,7 +294,7 @@ export class NRFBTShell {
     public async init() {
         if (!this.serialPort) {
             await new Promise((resolve, reject) => {
-                this.serialPort = new SerialPort({ path: this.comPort, baudRate: this.baudRate }, (err) => {
+                this.serialPort = new SerialPort({ path: this.path, baudRate: this.baudRate }, (err) => {
                     if (err) {
                         reject(err);
                     } else {
@@ -357,6 +359,16 @@ export class NRFBTShell {
         this.attachDisconnectListener(() => {}, btAddress);
     }
 
+    public async getMTU(btAddress: string) {
+        await this.guardSelectedDevice(btAddress);
+        const mtuValuePromise = this.waitForMessage(/MTU size: (\d+)/);
+        this.writeMessage('gatt att_mtu');
+        const mtuValue = await mtuValuePromise;
+        if (!mtuValue.matches) return null;
+        const mtu = parseInt(mtuValue.matches[1], 10);
+        this.updateDevice(btAddress, { mtu });
+    } 
+
     public async discoverPrimaryServices(btAddress: string) {
         await this.guardSelectedDevice(btAddress);
         const discoverRemove = this.attachToMessages((message, matches) => {
@@ -393,7 +405,7 @@ export class NRFBTShell {
                 if (characteristicMatches) {
                     const [, uuid, handle] = characteristicMatches;
                     const characteristicProperties = new BitField<CharacteristicProperties>();
-                    currentCharacteristic = { uuid, handle, serviceUUID, properties: characteristicProperties };
+                    currentCharacteristic = { uuid, handle: parseInt(handle, 16), serviceUUID, properties: characteristicProperties };
                     if (outputLines[i + 1]?.includes('Properties:')) {
                         i++; // We skip this line;
                         let propertiesLine = i + 1;
@@ -433,7 +445,7 @@ export class NRFBTShell {
         await this.guardSelectedDevice(btAddress);
         const characteristic = this.btCharacteristics[btAddress][characteristicUUID];
         const collectedMessagesPromise = this.collectMessagesBetween(/Read pending/, /Read complete: err (0x\d{2}) length 0/);
-        this.writeMessage(`gatt read ${parseInt(characteristic.handle, 10) + 1} 0`);
+        this.writeMessage(`gatt read ${(characteristic.handle + 1).toString(16)} 0`);
         const collectedMessages = await collectedMessagesPromise;
         let collectedLines = collectedMessages.split('\n');
 
@@ -477,7 +489,7 @@ export class NRFBTShell {
         await this.guardSelectedDevice(btAddress);
         const characteristic = this.btCharacteristics[btAddress][characteristicUUID];
         const waitingPromise = this.waitForMessage(/Write complete: err (0x\d{2})/);
-        this.writeMessage(`gatt write ${parseInt(characteristic.handle, 10) + 1} 0 ${data.toString('hex')}`);
+        this.writeMessage(`gatt write ${(characteristic.handle + 1).toString(16)} 0 ${data.toString('hex')}`);
         const { message, matches } = await waitingPromise;
         if (matches && matches[1] !== '0x00') {
             throw new Error(`Error writing to characteristic ${characteristic.uuid}, err: ${matches[1]}`);
@@ -486,9 +498,27 @@ export class NRFBTShell {
         return true;
     }
 
-    public async monitorCharacteristic(btAddress: string, characteristicUUID: string) {
+    public async monitorCharacteristic(btAddress: string, characteristicUUID: string, callback: (error: Error | null, data: Buffer | null) => void) {
         await this.guardSelectedDevice(btAddress);
         const characteristic = this.btCharacteristics[btAddress][characteristicUUID];
+
+        const unsubscribe = this.attachToMessages(async (message, matches) => {
+            if (!matches) return null;
+            const [, address, length] = matches;
+            const notifyDataPromise = this.waitForMessage(/Notify data: (.+)/);
+            this.writeMessage(`read_notify_data ${address} ${length}`);
+            const notifyData = await notifyDataPromise;
+            if (!notifyData.matches?.[1]) return null;
+            const notifyDataBuffer = Buffer.from(notifyData.matches[1].replace(/ /gm, '').replace(/0x/gm, ''), 'hex');
+            if (callback) callback(null, notifyDataBuffer);
+        }, /Notification: data (0x[a-zA-Z0-9]+) length (\d+)/);
+
+        // FIXME: Should discover descriptors and locations for it instead of this crap, but eh.
+        this.writeMessage(`gatt subscribe ${(characteristic.handle + 2).toString(16)} ${(characteristic.handle + 1).toString(16)} 0`);
+
+        return () => {
+            if (unsubscribe) unsubscribe();
+        }
     }
 
 

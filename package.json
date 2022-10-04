@@ -3,6 +3,9 @@
   "version": "0.0.1",
   "main": "index.js",
   "license": "MIT",
+  "scripts": {
+    "prepublish": "yarn tsc"
+  },
   "dependencies": {
     "easy-bits": "^1.2.2",
     "serialport": "^10.4.0",

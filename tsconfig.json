@@ -2,6 +2,7 @@
     "compilerOptions": {
         "module": "commonjs",
         "moduleResolution": "node",
+        "declaration": true,
         "downlevelIteration": true,
         "esModuleInterop": true,
         "noImplicitAny": true,
@@ -9,7 +10,8 @@
         "preserveConstEnums": true,
         "strict": true,
         "sourceMap": true,
-        "lib": ["ESNext"]
+        "lib": ["ESNext"],
+        "outDir": "dist"
     },
     "include": [
         "src/**/*"
